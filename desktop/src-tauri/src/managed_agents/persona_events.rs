@@ -196,6 +196,7 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
         source_team: None,
         source_team_persona_slug: Some(d_tag),
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::new(),
         respond_to: content.respond_to,
         respond_to_allowlist: content.respond_to_allowlist,
@@ -307,15 +308,39 @@ pub(crate) async fn flush_pending_events_at(
         let event = nostr::Event::from_json(&current.raw_event)
             .map_err(|e| format!("failed to parse retained event '{}': {e}", current.d_tag))?;
 
-        // NIP-IA requests are freshness-checked by the relay (±120s on
-        // `created_at`), so a request retained while the relay was
-        // unreachable would be permanently stale. Re-sign with a fresh
-        // timestamp at publish time; kind, tags, and content are preserved,
-        // and `mark_synced` below still compares against the retained row's
-        // original `created_at`/`content`, which are untouched.
-        let is_archive_request =
-            buzz_core_pkg::kind::is_identity_archive_request_kind(current.kind);
-        let event = if is_archive_request {
+        // Relay ingest rejects any event whose `created_at` is more than
+        // ±900s from server time (`crates/buzz-relay/src/handlers/ingest.rs`
+        // MAX_TIMESTAMP_DRIFT_SECS). A kind:5 tombstone is signed strictly past
+        // the head it retracts, so its retained `created_at` is the domination
+        // floor `f`: any publish at `t >= f` still soft-deletes the head (NIP-09
+        // only clears coordinate versions with `created_at <= t`). Reconcile the
+        // two constraints at publish time so a byte-frozen future-dated
+        // tombstone can never age out of the acceptance window and strand the
+        // head live forever:
+        //   f <= now         → re-date to `now` (dominates, in-window)
+        //   now < f <= now+900 → publish at `f` (dominates, in-window)
+        //   f > now+900       → no acceptable timestamp yet; leave pending and
+        //                       block its replacement, converging as the wall
+        //                       clock advances toward `f`.
+        // A boundary publish the relay still rejects self-heals: the submit
+        // error below re-queues it for the next sweep.
+        const RELAY_ACCEPT_WINDOW_SECS: i64 = 900;
+        let event = if current.kind == 5 {
+            let now = nostr::Timestamp::now().as_secs() as i64;
+            if current.created_at - now > RELAY_ACCEPT_WINDOW_SECS {
+                // Its replacement must keep deferring behind the unpublished
+                // tombstone so a re-created head is never wiped out of order.
+                failed_tombstones.insert((current.pubkey.clone(), current.d_tag.clone()));
+                continue;
+            }
+            redate_tombstone(&event, now.max(current.created_at), owner_keys)?
+        } else if buzz_core_pkg::kind::is_identity_archive_request_kind(current.kind) {
+            // NIP-IA requests are freshness-checked by the relay (±120s on
+            // `created_at`), so a request retained while the relay was
+            // unreachable would be permanently stale. Re-sign with a fresh
+            // timestamp at publish time; kind, tags, and content are preserved,
+            // and `mark_synced` below still compares against the retained row's
+            // original `created_at`/`content`, which are untouched.
             resign_with_fresh_timestamp(&event, state)?
         } else {
             event
@@ -372,6 +397,27 @@ fn resign_with_fresh_timestamp(
         .allow_self_tagging()
         .sign_with_keys(&keys)
         .map_err(|e| format!("failed to re-sign retained event: {e}"))
+}
+
+/// Re-sign a retained kind:5 tombstone at `created_at`, preserving its `a`-tag
+/// coordinate and (empty) content.
+///
+/// The flush loop chooses `created_at` in `[floor, now+900]` so the deletion
+/// both dominates the head it retracts (NIP-09 `created_at <=` soft-delete) and
+/// clears the relay's ±900s ingest window. Signing at the original owner keys
+/// keeps the event authored by the same identity that owns the coordinate; the
+/// `mark_synced` compare-and-clear below still keys on the retained row's
+/// untouched `created_at`/`content`, so a concurrent edit is never masked.
+fn redate_tombstone(
+    event: &nostr::Event,
+    created_at: i64,
+    owner_keys: &nostr::Keys,
+) -> Result<nostr::Event, String> {
+    nostr::EventBuilder::new(event.kind, event.content.clone())
+        .tags(event.tags.iter().cloned())
+        .custom_created_at(nostr::Timestamp::from(created_at as u64))
+        .sign_with_keys(owner_keys)
+        .map_err(|e| format!("failed to re-sign tombstone: {e}"))
 }
 
 /// SHA-256 (lowercase hex) of a persona's canonical content JSON.
