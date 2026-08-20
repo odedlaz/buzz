@@ -374,8 +374,17 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
     `mention-suggestion-${managedPubkey}`,
   );
   const relayRow = dropdown.getByTestId(`mention-suggestion-${relayPubkey}`);
-  await expect(managedRow).toContainText("agent · managed here");
-  await expect(relayRow).toContainText("agent · managed elsewhere");
+  await expect(managedRow).toContainText("agent");
+  await expect(managedRow.getByTestId("mention-agent-provenance")).toHaveCount(
+    0,
+  );
+  await expect(relayRow).toContainText("agent");
+  await expect(
+    relayRow.getByTestId("mention-agent-provenance"),
+  ).toHaveAttribute("aria-label", "From another Buzz setup");
+  await expect(relayRow).not.toContainText("Other setup");
+  await expect(managedRow).not.toContainText("managed by you");
+  await expect(relayRow).not.toContainText("managed by you");
 
   const collisionKeys = dropdown.getByTestId("mention-collision-npub");
   await expect(collisionKeys).toHaveCount(2);
@@ -399,7 +408,7 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
     await input.press("ArrowDown");
   }
   await input.press("Enter");
-  await page.keyboard.type("local");
+  await input.fill("@carl local");
   await page.getByTestId("send-message").click();
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, "@carl local"))
@@ -412,7 +421,7 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   await reopenedDropdown
     .getByTestId(`mention-suggestion-${relayPubkey}`)
     .click();
-  await page.keyboard.type("remote");
+  await input.fill("@carl remote");
   await page.getByTestId("send-message").click();
   const sendWithoutInviting = page.getByRole("button", { name: "Do nothing" });
   try {
@@ -424,6 +433,14 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, "@carl remote"))
     .toEqual([relayPubkey]);
+
+  await page.getByTestId("channel-members-trigger").click();
+  await expect(
+    page.getByTestId(`sidebar-member-agent-provenance-${managedPubkey}`),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId(`sidebar-member-agent-provenance-${relayPubkey}`),
+  ).toHaveAttribute("aria-label", "From another Buzz setup");
 });
 
 test("relay-only shared agents emit an outbound mention tag when selected", async ({
