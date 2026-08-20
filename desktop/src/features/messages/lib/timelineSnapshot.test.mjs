@@ -610,3 +610,29 @@ test("isRenderedTimelineBehindHistoryPrepend: false when rendered oldest already
   // not behind an older-history prepend.
   assert.equal(isRenderedTimelineBehindHistoryPrepend([a], [a, b]), false);
 });
+
+test("timeline-body-surface: the channel-switch gap is blank, never a skeleton flash", () => {
+  // Deferred snapshot still holds the previous channel while the live one
+  // moved on. Without an authoritative load in flight this is a 1-2 frame
+  // render-pipeline gap — paint background, not flashing skeleton bars.
+  assert.equal(
+    selectTimelineBodySurface({
+      deferredCount: 5,
+      isLoading: false,
+      isSwitchGap: true,
+      liveCount: 3,
+    }),
+    "blank",
+  );
+  // A genuine authoritative load during the gap keeps the skeleton: the cold
+  // switch is a real loading state, not a pipeline artifact.
+  assert.equal(
+    selectTimelineBodySurface({
+      deferredCount: 5,
+      isLoading: true,
+      isSwitchGap: true,
+      liveCount: 0,
+    }),
+    "skeleton",
+  );
+});
