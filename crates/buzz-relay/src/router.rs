@@ -553,7 +553,10 @@ mod tests {
                     "/blob",
                     get(|| async {
                         (
-                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            [
+                                (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                                (axum::http::header::ACCEPT_RANGES, "bytes"),
+                            ],
                             json_body(200),
                         )
                     }),
@@ -574,6 +577,19 @@ mod tests {
                     .map(|v| v.to_str().unwrap()),
                 Some("gzip"),
                 "if this ever stops being true the media exclusion can be revisited"
+            );
+            // And why the exclusion is correctness, not CPU: tower-http strips
+            // `Accept-Ranges` when it compresses, while `api::media` sends it on
+            // every response "so video players know seeking is supported". A 206
+            // is safe -- the layer declines anything carrying `Content-Range` --
+            // but a compressed 200 full-body video loses the header, and a player
+            // probing with a plain GET then concludes seeking is unsupported.
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::ACCEPT_RANGES)
+                    .is_none(),
+                "compression strips Accept-Ranges, which is why media must not go through it"
             );
         }
 
