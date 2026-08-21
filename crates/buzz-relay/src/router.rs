@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
+    extract::{ConnectInfo, FromRequest, PerMessageDeflate, State, WebSocketUpgrade},
     http::{HeaderMap, Request, StatusCode},
     middleware,
     response::{IntoResponse, Json},
@@ -359,8 +359,15 @@ fn limit_relay_websocket<F>(
 ) -> WebSocketUpgrade<F> {
     // recv_loop keeps the application-level check as defense in depth, but
     // parser limits must be set before tungstenite assembles the message.
+    //
+    // Compression is per message and transparent: `handle_connection` sees the
+    // same uncompressed frames either way, and a client that does not offer the
+    // extension gets an uncompressed connection with nothing to handle. The
+    // limits above still apply to the decompressed message, so a small
+    // compressed frame cannot expand past them.
     ws.max_message_size(max_frame_bytes)
         .max_frame_size(max_frame_bytes)
+        .compression(PerMessageDeflate::new())
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -475,6 +482,55 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    /// Guards the placement, not just the mechanism: this drives a real
+    /// handshake through `limit_relay_websocket` itself, so deleting the
+    /// `compression` call there fails here. The measurement harness builds its
+    /// own routes and would stay green.
+    #[tokio::test]
+    async fn the_production_upgrade_helper_negotiates_deflate() {
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                limit_relay_websocket(ws, 64 * 1024).on_upgrade(|mut socket| async move {
+                    let _ = socket
+                        .send(axum::extract::ws::Message::Text("compress me".repeat(64).into()))
+                        .await;
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut client = tungstenite_pmd::protocol::WebSocketConfig::default();
+        client.extensions.permessage_deflate = Some(Default::default());
+        let (mut socket, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(client),
+            false,
+        )
+        .await
+        .expect("client connects");
+
+        assert_eq!(
+            response.headers()[axum::http::header::SEC_WEBSOCKET_EXTENSIONS],
+            "permessage-deflate"
+        );
+
+        // The client can only decode this if the server really compressed it.
+        let msg = futures_util::StreamExt::next(&mut socket)
+            .await
+            .expect("a frame arrives")
+            .expect("no protocol error");
+        assert_eq!(
+            msg,
+            tungstenite_pmd::protocol::Message::Text("compress me".repeat(64).into())
+        );
+    }
 
     #[test]
     fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
