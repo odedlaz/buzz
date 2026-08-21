@@ -668,6 +668,76 @@ mod tests {
                 "frames must still flow after the upgrade"
             );
         }
+
+        #[tokio::test]
+        async fn merged_in_routes_stay_off_the_layer() {
+            // The reason the layer attaches to `api_router` and not to `merged`.
+            // `Router::layer` wraps the routes present when it is called, so anything
+            // merged in afterwards must not inherit it -- otherwise media is re-gzipped
+            // and loses `Accept-Ranges`. Asserting the placement, not just the hazard.
+            let media = Router::new().route(
+                "/blob",
+                get(|| async {
+                    (
+                        [
+                            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                            (axum::http::header::ACCEPT_RANGES, "bytes"),
+                        ],
+                        json_body(200),
+                    )
+                }),
+            );
+            let app = Router::new()
+                .route(
+                    "/query",
+                    get(|| async {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            json_body(200),
+                        )
+                    }),
+                )
+                .layer(CompressionLayer::new())
+                .merge(media);
+            let addr = serve(app).await;
+            let client = reqwest::Client::new();
+
+            // Known-positive control in the same app: without it, an uncompressed
+            // /blob cannot be told apart from a layer that is not working at all.
+            let json = client
+                .get(format!("http://{addr}/query"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                json.headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .map(|v| v.to_str().unwrap()),
+                Some("gzip"),
+                "control: the layered route must still compress in this composition"
+            );
+
+            let blob = client
+                .get(format!("http://{addr}/blob"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .expect("request");
+            assert!(
+                blob.headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .is_none(),
+                "a route merged in after .layer() must not be compressed"
+            );
+            assert_eq!(
+                blob.headers()
+                    .get(axum::http::header::ACCEPT_RANGES)
+                    .map(|v| v.to_str().unwrap()),
+                Some("bytes"),
+                "and it must keep Accept-Ranges, which compression would have stripped"
+            );
+        }
     }
 
     #[test]
