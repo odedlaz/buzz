@@ -194,8 +194,5 @@ strip = true
 # since 2017. This pins tungstenite 0.30 to the fork carrying it, so the relay
 # can negotiate deflate on its client socket. Patching 0.30 leaves axum 0.8's own
 # tungstenite 0.29 on crates.io, untouched. Revert once the feature lands upstream.
-# The chain is buzz -> axum -> tungstenite: axum is forked so its `ws` upgrade
-# can negotiate the extension, and it carries the tungstenite patch itself.
-axum = { git = "https://github.com/odedlaz/axum", branch = "olazar/permessage-deflate-0.8.9" }
 tungstenite = { git = "https://github.com/odedlaz/tungstenite-rs", branch = "permessage-deflate" }
 aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce3620dd434c1f810101d672cf384268dbb0f" }
