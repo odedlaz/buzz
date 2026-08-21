@@ -81,6 +81,12 @@ metrics-exporter-prometheus = { workspace = true }
 metrics-util    = { workspace = true }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
+# permessage-deflate for the client socket: axum 0.8 cannot answer an extension
+# offer, so the relay negotiates it and drives tungstenite 0.30 itself.
+tokio-tungstenite-pmd = { workspace = true }
+tungstenite-pmd = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 
 [features]
 dev = ["buzz-auth/dev"]

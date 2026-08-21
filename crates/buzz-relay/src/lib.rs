@@ -49,6 +49,10 @@ pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.
 pub mod webhook_secret;
 /// Workflow action sink — relay-side implementation of [`buzz_workflow::ActionSink`].
+/// `permessage-deflate` negotiation for the client socket, which axum's
+/// upgrade cannot answer.
+mod ws_deflate;
+
 pub mod workflow_sink;
 
 pub use config::Config;

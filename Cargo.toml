@@ -123,6 +123,14 @@ futures-util = "0.3"
 
 # WebSocket client (test client)
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# permessage-deflate needs tungstenite 0.30; axum 0.8 is still on 0.29. Both
+# resolve side by side, and only the 0.30 edge is patched to our fork below.
+tokio-tungstenite-pmd = { package = "tokio-tungstenite", version = "0.30" }
+tungstenite-pmd = { package = "tungstenite", version = "0.30", features = ["deflate"] }
+# The relay drives its own WebSocket upgrade for deflate, so it needs the raw
+# `OnUpgrade` and the tokio IO shim axum uses internally. Already transitive.
+hyper = { version = "1.9", features = ["server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 url = "2"
 
 # Property-based testing (dev-only)
@@ -182,4 +190,9 @@ strip = true
 # (FULL_URI + token-file + Authorization header, refresh-safe, with a loopback
 # allowlist for the auth token). Revert to crates.io once #449 lands upstream.
 [patch.crates-io]
+# permessage-deflate (RFC 7692) is unimplemented in tungstenite -- issue #2, open
+# since 2017. This pins tungstenite 0.30 to the fork carrying it, so the relay
+# can negotiate deflate on its client socket. Patching 0.30 leaves axum 0.8's own
+# tungstenite 0.29 on crates.io, untouched. Revert once the feature lands upstream.
+tungstenite = { git = "https://github.com/odedlaz/tungstenite-rs", branch = "permessage-deflate" }
 aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce3620dd434c1f810101d672cf384268dbb0f" }

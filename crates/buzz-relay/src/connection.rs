@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket};
-use futures_util::{Sink, SinkExt, StreamExt};
+use axum::extract::ws::Message as WsMessage;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -27,6 +27,22 @@ use crate::state::{
 
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The socket a relay connection is driven over.
+///
+/// Two implementations reach this: axum's `WebSocket` for a plain connection, and
+/// the `permessage-deflate` stream from [`crate::ws_deflate`] when the client
+/// negotiated compression. Both are normalised to axum's message and error types
+/// at the boundary so the loops below stay unaware of which one they hold.
+pub trait RelaySocket:
+    Stream<Item = Result<WsMessage, axum::Error>> + Sink<WsMessage> + Send + Unpin + 'static
+{
+}
+
+impl<T> RelaySocket for T where
+    T: Stream<Item = Result<WsMessage, axum::Error>> + Sink<WsMessage> + Send + Unpin + 'static
+{
+}
 
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
@@ -122,12 +138,14 @@ impl ConnectionState {
 ///
 /// Acquires a connection semaphore permit, sends the NIP-42 AUTH challenge,
 /// then drives the send, heartbeat, and receive loops until the connection closes.
-pub async fn handle_connection(
-    socket: WebSocket,
+pub async fn handle_connection<S>(
+    socket: S,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
-) {
+) where
+    S: RelaySocket,
+{
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
     let control = CommunityConnectionControl::new(cancel);
@@ -146,14 +164,16 @@ pub async fn handle_connection(
     .await;
 }
 
-async fn handle_active_connection(
-    socket: WebSocket,
+async fn handle_active_connection<S>(
+    socket: S,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
     conn_id: Uuid,
     control: CommunityConnectionControl,
-) {
+) where
+    S: RelaySocket,
+{
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
@@ -324,8 +344,8 @@ async fn handle_active_connection(
 /// giving them priority over data frames. If the underlying socket writer
 /// is stalled, control frames queue in the small ctrl_rx buffer; callers
 /// treat a full control channel as terminal (Bug 7 fix).
-async fn send_loop(
-    ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
+async fn send_loop<S: RelaySocket>(
+    ws_send: futures_util::stream::SplitSink<S, WsMessage>,
     data_rx: mpsc::Receiver<WsMessage>,
     ctrl_rx: mpsc::Receiver<WsMessage>,
     restart_rx: mpsc::Receiver<RestartClose>,
@@ -463,8 +483,8 @@ async fn heartbeat_loop(
     }
 }
 
-async fn recv_loop(
-    mut ws_recv: futures_util::stream::SplitStream<WebSocket>,
+async fn recv_loop<S: RelaySocket>(
+    mut ws_recv: futures_util::stream::SplitStream<S>,
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
     missed_pongs: Arc<AtomicU8>,

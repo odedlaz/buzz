@@ -25,6 +25,7 @@ use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
 use crate::state::AppState;
+use crate::ws_deflate;
 
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
 ///
@@ -257,7 +258,7 @@ pub fn build_health_router(state: Arc<AppState>) -> Router {
 async fn nip11_or_ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
 ) -> impl IntoResponse {
     let addr = req
         .extensions()
@@ -320,6 +321,31 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+
+    // axum's upgrade emits only Connection, Upgrade, Sec-WebSocket-Accept and
+    // optionally Sec-WebSocket-Protocol, so it can never answer an extension
+    // offer. Answer it here instead. `try_upgrade` returns `None` unless this is
+    // a genuine RFC 6455 upgrade, so a malformed request still gets axum's
+    // rejection below rather than a hand-rolled one. Skipped while draining so
+    // the shutdown refusal in the arm below keeps its behaviour.
+    if !state.shutting_down.load(Ordering::Relaxed) {
+        if let Some(negotiated) = ws_deflate::negotiate(
+            req.headers()
+                .get(axum::http::header::SEC_WEBSOCKET_EXTENSIONS)
+                .and_then(|v| v.to_str().ok()),
+        ) {
+            let conn_state = Arc::clone(&state);
+            let conn_tenant = tenant.clone();
+            if let Some(response) =
+                ws_deflate::try_upgrade(&mut req, negotiated, max_frame_bytes, move |socket| {
+                    handle_connection(socket, conn_state, addr, conn_tenant)
+                })
+            {
+                return response.into_response();
+            }
+        }
+    }
+
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
             // Shutting down: refuse new sockets instead of accepting a
