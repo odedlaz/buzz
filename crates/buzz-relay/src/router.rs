@@ -14,6 +14,7 @@ use axum::{
 };
 use serde_json::json;
 use tower::ServiceExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
@@ -137,6 +138,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // Reject request bodies larger than 1 MB to prevent resource exhaustion.
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        // Compress JSON responses. Deliberately on this router and not the
+        // merged one: `media_router` serves tenant blobs that are already
+        // compressed, and tower-http 0.6's default predicate skips `image/`
+        // but not `video/*`, `audio/*` or `application/octet-stream`, so a
+        // blanket layer would spend CPU re-compressing them.
+        //
+        // This router also carries the WebSocket upgrade on `/` and the huddle
+        // audio upgrade, which a response-body layer must not disturb. A 101
+        // carries no body and no compressible content type, so the predicate
+        // declines it — asserted in `websocket_upgrade_survives_compression`
+        // rather than assumed, because getting it wrong breaks every client.
+        .layer(CompressionLayer::new())
         .with_state(state.clone());
 
     // Merge — each sub-router carries its own body limit.
@@ -475,6 +488,138 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    /// The three things the `CompressionLayer` placement rests on.
+    ///
+    /// Built on a minimal router rather than `create_router`, which needs
+    /// Postgres and Redis. What is under test is the layer's interaction with
+    /// response bodies and upgrades, and that does not depend on relay state.
+    mod compression {
+        use super::*;
+
+        fn json_body(n: usize) -> String {
+            // Above SizeAbove(32) and compressible, like a channel window.
+            format!("[{}]", vec!["\"buzz relay event\""; n].join(","))
+        }
+
+        async fn serve(app: Router) -> std::net::SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        #[tokio::test]
+        async fn json_responses_are_gzipped() {
+            let app = Router::new()
+                .route(
+                    "/query",
+                    get(|| async {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            json_body(200),
+                        )
+                    }),
+                )
+                .layer(CompressionLayer::new());
+            let addr = serve(app).await;
+
+            let response = reqwest::Client::new()
+                .get(format!("http://{addr}/query"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .map(|v| v.to_str().unwrap()),
+                Some("gzip"),
+                "the JSON bridge is the reason this layer exists"
+            );
+        }
+
+        #[tokio::test]
+        async fn octet_stream_is_compressed_which_is_why_media_stays_off_this_layer() {
+            // tower-http 0.6's default predicate skips `image/` but not
+            // `application/octet-stream`, so media blobs would be re-compressed
+            // if this layer were attached to the merged router. This asserts the
+            // gap rather than trusting the docs for it.
+            let app = Router::new()
+                .route(
+                    "/blob",
+                    get(|| async {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            json_body(200),
+                        )
+                    }),
+                )
+                .layer(CompressionLayer::new());
+            let addr = serve(app).await;
+
+            let response = reqwest::Client::new()
+                .get(format!("http://{addr}/blob"))
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .map(|v| v.to_str().unwrap()),
+                Some("gzip"),
+                "if this ever stops being true the media exclusion can be revisited"
+            );
+        }
+
+        #[tokio::test]
+        async fn websocket_upgrade_survives_compression() {
+            // A response-body middleware next to an upgrade is the classic
+            // footgun. A 101 has no body and no compressible content type, so
+            // the predicate should decline -- asserted, not assumed.
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(move |ws: WebSocketUpgrade| {
+                        let tx = tx.clone();
+                        async move {
+                            ws.on_upgrade(move |mut socket| async move {
+                                let _ = tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                            })
+                        }
+                    }),
+                )
+                .layer(CompressionLayer::new());
+            let addr = serve(app).await;
+
+            let (mut client, response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("the upgrade must complete with the layer attached");
+            assert_eq!(response.status().as_u16(), 101);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .is_none(),
+                "a 101 must not be labelled as encoded"
+            );
+            client
+                .send(Message::Text("ping".into()))
+                .await
+                .expect("send");
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await,
+                Ok(Some(true)),
+                "frames must still flow after the upgrade"
+            );
+        }
+    }
 
     #[test]
     fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
