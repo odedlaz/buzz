@@ -774,6 +774,97 @@ mod upgrade_tests {
         }
     }
 
+    /// Ratio against the server's compression window, 9..=15. Deterministic, so
+    /// no repetition or control -- same shape as the level sweep.
+    ///
+    /// The server can set this unilaterally: an inflater with a wider window
+    /// reads a narrower stream, so we compress at N and put nothing in the
+    /// response. That is what makes it the one memory knob usable without
+    /// client cooperation.
+    ///
+    /// ```sh
+    /// BUZZ_DEFLATE_FRAMES=/path/to/events.jsonl \
+    ///   cargo test -p buzz-relay --lib window_sweep -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a captured frame file; see the doc comment"]
+    async fn window_sweep() {
+        let path = std::env::var("BUZZ_DEFLATE_FRAMES").expect("set BUZZ_DEFLATE_FRAMES");
+        let frames: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read the frame file")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        let raw: usize = frames.iter().map(String::len).sum();
+
+        for wb in 9..=15u8 {
+            let harness = spawn_harness_many_at_window(frames.clone(), wb).await;
+            let mut client = tokio_tungstenite_pmd::connect_async_with_config(
+                format!("ws://{}/", harness.proxy_addr),
+                Some(client_config()),
+                false,
+            )
+            .await
+            .expect("client connects")
+            .0;
+            let mut seen = 0usize;
+            while seen < frames.len() {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(30), client.next())
+                    .await
+                    .expect("frames arrive")
+                    .expect("open")
+                    .expect("no error");
+                if matches!(msg, tungstenite_pmd::protocol::Message::Text(_)) {
+                    seen += 1;
+                }
+            }
+            let wire = harness.wire_bytes.load(Ordering::Relaxed);
+            println!(
+                "WINDOW wb={wb} raw={raw} wire={wire} ratio={:.3}x",
+                raw as f64 / wire as f64
+            );
+        }
+    }
+
+    async fn spawn_harness_many_at_window(payloads: Vec<String>, wb: u8) -> Harness {
+        let app = Router::new().route(
+            "/",
+            get(move |mut req: Request<Body>| {
+                let payloads = payloads.clone();
+                async move {
+                    let mut negotiated = negotiate(
+                        req.headers()
+                            .get(header::SEC_WEBSOCKET_EXTENSIONS)
+                            .and_then(|v| v.to_str().ok()),
+                    )
+                    .expect("offered");
+                    negotiated.deflate = negotiated
+                        .deflate
+                        .set_max_window_bits(Role::Server, wb)
+                        .expect("9..=15 is the supported range");
+                    try_upgrade(
+                        &mut req,
+                        negotiated,
+                        1 << 20,
+                        move |mut socket| async move {
+                            for payload in payloads {
+                                socket
+                                    .send(WsMessage::Text(payload.into()))
+                                    .await
+                                    .expect("send");
+                            }
+                            socket.flush().await.expect("flush");
+                            let _ = socket.next().await;
+                        },
+                    )
+                    .expect("valid upgrade")
+                }
+            }),
+        );
+        serve_through_counting_proxy(app).await
+    }
+
     async fn spawn_harness_many_at_level(payloads: Vec<String>, level: u32) -> Harness {
         let app = Router::new().route(
             "/",
