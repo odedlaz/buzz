@@ -5579,6 +5579,13 @@ async function handleGetChannelWindow(
   };
 
   if (!args.cursor) {
+    // TEST-ONLY probe: head (cursorless) window fetches, keyed for specs that
+    // assert prefetch behavior. Continuations keep their own counter below.
+    const headProbe = window as unknown as {
+      __CHANNEL_WINDOW_HEAD_FETCH_COUNT__?: number;
+    };
+    headProbe.__CHANNEL_WINDOW_HEAD_FETCH_COUNT__ =
+      (headProbe.__CHANNEL_WINDOW_HEAD_FETCH_COUNT__ ?? 0) + 1;
     return execute();
   }
 
