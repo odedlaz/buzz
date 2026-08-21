@@ -139,10 +139,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Reject request bodies larger than 1 MB to prevent resource exhaustion.
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         // Compress JSON responses. Deliberately on this router and not the
-        // merged one: `media_router` serves tenant blobs that are already
-        // compressed, and tower-http 0.6's default predicate skips `image/`
-        // but not `video/*`, `audio/*` or `application/octet-stream`, so a
-        // blanket layer would spend CPU re-compressing them.
+        // merged one, and the reason is correctness before CPU.
+        //
+        // tower-http 0.6's default predicate skips `image/` but not `video/*`,
+        // `audio/*` or `application/octet-stream`, so media is not protected by
+        // the predicate — only by this placement. Compressing also *strips*
+        // `Accept-Ranges`, which `api::media` sends on every response so video
+        // players know seeking is supported. A 206 is safe (the layer declines
+        // anything carrying `Content-Range`) but a compressed 200 full-body
+        // video would lose the header and a player probing with a plain GET
+        // concludes seeking is unsupported. So a blanket layer on `merged`
+        // would break video seeking, not merely waste CPU on packfiles and
+        // blobs. Do not consolidate these layers.
+        //
+        // `admin_router` and `git_policy_router` also serve JSON and are left
+        // uncompressed: they merge in after this point, and their traffic is
+        // negligible next to the history bridge. A choice, not an oversight.
         //
         // This router also carries the WebSocket upgrade on `/` and the huddle
         // audio upgrade, which a response-body layer must not disturb. A 101
@@ -482,6 +494,7 @@ mod tests {
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use tower::ServiceBuilder;
     use tracing::Instrument as _;
@@ -491,7 +504,7 @@ mod tests {
 
     /// The three things the `CompressionLayer` placement rests on.
     ///
-    /// Built on a minimal router rather than `create_router`, which needs
+    /// Built on a minimal router rather than `build_router`, which needs
     /// Postgres and Redis. What is under test is the layer's interaction with
     /// response bodies and upgrades, and that does not depend on relay state.
     mod compression {
@@ -506,7 +519,11 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
             tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                // Surface an accept-loop failure instead of losing its cause to
+                // a timeout somewhere else in the test.
+                if let Err(e) = axum::serve(listener, app).await {
+                    panic!("test server failed: {e}");
+                }
             });
             addr
         }
@@ -614,7 +631,23 @@ mod tests {
                 .layer(CompressionLayer::new());
             let addr = serve(app).await;
 
-            let (mut client, response) = connect_async(format!("ws://{addr}/"))
+            // The handshake must *request* gzip, or tower-http selects identity
+            // and the test says nothing about the predicate declining an
+            // upgrade. `connect_async` sends no `Accept-Encoding`.
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("a valid ws:// request");
+            request.headers_mut().insert(
+                axum::http::header::ACCEPT_ENCODING,
+                axum::http::HeaderValue::from_static("gzip"),
+            );
+            assert!(
+                request
+                    .headers()
+                    .contains_key(axum::http::header::ACCEPT_ENCODING),
+                "the request must carry Accept-Encoding or this test only exercises identity"
+            );
+            let (mut client, response) = connect_async(request)
                 .await
                 .expect("the upgrade must complete with the layer attached");
             assert_eq!(response.status().as_u16(), 101);
