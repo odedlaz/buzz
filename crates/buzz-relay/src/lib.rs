@@ -2,6 +2,11 @@
 #![warn(missing_docs)]
 //! NIP-01 WebSocket relay for Buzz private team communication.
 
+#[cfg(test)]
+mod deflate_adapter;
+#[cfg(test)]
+mod deflate_measure;
+
 mod admission;
 
 /// REST API route handlers.
