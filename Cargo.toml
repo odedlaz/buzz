@@ -191,5 +191,5 @@ aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce36
 # permessage-deflate (RFC 7692) is unimplemented in tungstenite -- upstream issue
 # snapview/tungstenite-rs#2, open since 2017 -- and axum has no API to negotiate
 # it. Both forks carry the work; drop each one as it lands upstream.
-tungstenite = { git = "https://github.com/odedlaz/tungstenite-rs", branch = "permessage-deflate" }
+tungstenite = { git = "https://github.com/odedlaz/tungstenite-rs", branch = "permessage-deflate-series" }
 axum = { git = "https://github.com/odedlaz/axum", branch = "olazar/permessage-deflate-0.8.9" }
