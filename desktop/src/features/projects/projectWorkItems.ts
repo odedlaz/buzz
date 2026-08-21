@@ -82,6 +82,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   fetchEvents: (
     filter: FetchEventsInput,
   ) => Promise<RelayEvent[]> = relayClient.fetchEvents.bind(relayClient),
+  signal?: AbortSignal,
 ): Promise<ProjectsWorkItemsResult<TProject>> {
   const repoAddresses = [
     ...new Set(
@@ -129,6 +130,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
             .filter((event) => event.kind === KIND_GIT_ISSUE)
             .map((event) => event.id),
           fetchEvents,
+          signal,
         ),
       ),
     ]);
