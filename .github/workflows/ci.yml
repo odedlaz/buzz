@@ -674,6 +674,27 @@ jobs:
           VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
           ON CONFLICT (lower(host)) DO NOTHING
           ;"
+      - name: Relay lib tests (Postgres-backed)
+        # First CI execution of these tests: buzz-relay is absent from `just
+        # test-unit`'s package enumeration and every other consumer of this
+        # archive passes `--run-ignored ignored-only`. It cannot join that
+        # infra-free enumeration because its DB-touching lib tests are not
+        # #[ignore]d, so the suite runs here, after the schema and before the
+        # relay competes for the DB.
+        #
+        # demo_join_forwarded_arm_round_trips_echo is quarantined by exact name:
+        # it self-skips when Redis is unreachable and fails 8 of 12 full-suite
+        # runs when Redis is present, always on its own 10s echo timeout. The
+        # other 903 non-ignored relay lib tests run.
+        # TODO: cite the tracker as a full URL once the issue venue is settled —
+        # a bare #N resolves against whichever repository renders this file.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and kind(lib) and not test(=api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo)'
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
