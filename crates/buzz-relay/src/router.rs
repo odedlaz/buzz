@@ -465,6 +465,7 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::header::SEC_WEBSOCKET_EXTENSIONS;
     use axum::{routing::get, Router};
     use futures_util::SinkExt;
     use opentelemetry::trace::TracerProvider as _;
@@ -614,6 +615,50 @@ mod tests {
         assert!(
             !handler_receives_message_with_limit(limit, limit + 1).await,
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
+        );
+    }
+
+    /// Binds the production compression policy. The `deflate_integration_tests`
+    /// rows build their own upgrade, so without this assertion deleting
+    /// `.compression(...)` from `limit_relay_websocket` leaves every row green.
+    #[tokio::test]
+    async fn relay_websocket_route_negotiates_permessage_deflate() {
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                limit_relay_websocket(ws, 1 << 20).on_upgrade(|mut socket| async move {
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("connect deflate-offering test client");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok());
+
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            negotiated,
+            Some("permessage-deflate"),
+            "the relay route must negotiate permessage-deflate for an offering client"
         );
     }
 }

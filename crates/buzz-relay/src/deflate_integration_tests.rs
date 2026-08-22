@@ -45,8 +45,8 @@ async fn spawn_harness_many(payloads: Vec<String>, policy: Option<PerMessageDefl
         get(move |ws: WebSocketUpgrade| {
             let payloads = payloads.clone();
             async move {
-                // This is the production composition point: Buzz's parser
-                // limits and compression policy live on the same axum builder.
+                // Mirror the production policy while allowing the ignored
+                // diagnostic sweeps below to select a level or window.
                 let ws = ws.max_message_size(1 << 20).max_frame_size(1 << 20);
                 match policy {
                     Some(policy) => ws
