@@ -366,9 +366,11 @@ fn limit_relay_websocket<F>(
         .max_message_size(max_frame_bytes)
         .max_frame_size(max_frame_bytes);
 
-    // Off must skip the call, not pass a weaker policy: constructing the
-    // extension allocates a compressor and a decompressor per connection and
-    // holds both for its lifetime, which is the cost this gate exists to avoid.
+    // Off must skip the call rather than weaken the policy: `new()` only
+    // installs a policy, and any policy still offers the extension — the fork
+    // documents `no_context_takeover` as not reducing memory. The cost lands
+    // when an offer negotiates, holding a compressor and a decompressor for the
+    // lifetime of every such connection.
     if permessage_deflate_enabled {
         limited.compression(PerMessageDeflate::new())
     } else {
@@ -793,6 +795,129 @@ mod tests {
         assert_eq!(
             negotiated, None,
             "gated off, the relay must not negotiate permessage-deflate"
+        );
+    }
+
+    /// Build a production `AppState` whose route can actually bind a tenant.
+    ///
+    /// `bind_community` is a real query, so the pool connects eagerly here: a
+    /// lazy pool would defer the failure into a 404 that this test cannot tell
+    /// apart from a gated-off relay.
+    async fn production_state(enabled: bool, authority: &str) -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.permessage_deflate_enabled = enabled;
+        config.require_relay_membership = false;
+        config.require_auth_token = false;
+
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("the production route binds its tenant from Postgres");
+        sqlx::query(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) ON CONFLICT (lower(host)) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(authority)
+        .execute(&pool)
+        .await
+        .expect("seed the community this test's host maps to");
+
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    /// Handshake a deflate-offering client against the real router and report
+    /// what the production composition negotiated.
+    async fn negotiate_through_production_route(enabled: bool) -> (StatusCode, Option<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind production route listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let authority = format!("127.0.0.1:{}", addr.port());
+        let state = production_state(enabled, &authority).await;
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_router(state)).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{authority}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("the production route must complete the handshake");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let status = response.status();
+
+        server.abort();
+        let _ = server.await;
+
+        (status, negotiated)
+    }
+
+    /// The four rows above call `limit_relay_websocket` with literals, so
+    /// replacing the production read at `nip11_or_ws_handler` with a constant
+    /// leaves every one of them green. This row is the only one that fails.
+    ///
+    /// Each arm asserts the 101 before the header: the gate sits downstream of
+    /// the host-to-tenant bind, and an unmapped host answers 404 carrying no
+    /// extension header — byte-identical to a correctly gated-off relay, and
+    /// green even with the branch deleted.
+    #[tokio::test]
+    async fn production_route_negotiates_deflate_only_when_the_config_enables_it() {
+        let (off_status, off_negotiated) = negotiate_through_production_route(false).await;
+        assert_eq!(
+            off_status,
+            StatusCode::SWITCHING_PROTOCOLS,
+            "the off arm must reach the gate, not stop at a tenant rejection"
+        );
+        assert_eq!(
+            off_negotiated, None,
+            "default-off must decline the extension on the production route"
+        );
+
+        let (on_status, on_negotiated) = negotiate_through_production_route(true).await;
+        assert_eq!(
+            on_status,
+            StatusCode::SWITCHING_PROTOCOLS,
+            "the on arm must reach the gate, not stop at a tenant rejection"
+        );
+        assert_eq!(
+            on_negotiated.as_deref(),
+            Some("permessage-deflate"),
+            "explicit on must negotiate exactly the parameter-free extension"
         );
     }
 }

@@ -146,6 +146,21 @@ pub fn install(port: u16, gauge_idle_timeout_secs: u64) {
     tokio::spawn(exporter);
 }
 
+/// Write the relay's static policy gauges.
+///
+/// [`install`] evicts any gauge that goes idle, and nothing else ever writes
+/// these two series, so a boot-only emission leaves the scrape output one idle
+/// window later. Callers must re-emit below that window; the usage poller does,
+/// and its interval is what the window is floored against.
+pub fn emit_policy_gauges(config: &crate::config::Config) {
+    metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
+    metrics::gauge!("buzz_permessage_deflate_enabled").set(if config.permessage_deflate_enabled {
+        1.0
+    } else {
+        0.0
+    });
+}
+
 /// Axum middleware that records CAKE framework HTTP metrics.
 ///
 /// Emits:
@@ -204,4 +219,49 @@ pub async fn track_metrics(req: Request, next: Next) -> Response {
     metrics::histogram!("http_request_latency_ms", &labels).record(latency_ms);
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-emitting on a cadence only helps if idle eviction is real and a later
+    /// write restores the series, so pin both rather than trusting the
+    /// exporter's documentation.
+    #[test]
+    fn policy_gauges_are_evicted_when_idle_and_restored_by_re_emission() {
+        const IDLE: Duration = Duration::from_millis(50);
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(MetricKindMask::GAUGE, Some(IDLE))
+            .build_recorder();
+        let handle = recorder.handle();
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.audit_enabled = true;
+        config.permessage_deflate_enabled = false;
+
+        metrics::with_local_recorder(&recorder, || emit_policy_gauges(&config));
+        // Distinct values, so a swap inside the helper fails here too.
+        let fresh = handle.render();
+        assert!(fresh.contains("buzz_audit_enabled 1"), "{fresh}");
+        assert!(
+            fresh.contains("buzz_permessage_deflate_enabled 0"),
+            "{fresh}"
+        );
+
+        std::thread::sleep(IDLE * 2);
+        handle.run_upkeep();
+        let idle = handle.render();
+        assert!(
+            !idle.contains("buzz_permessage_deflate_enabled"),
+            "a boot-only gauge does not survive its idle window: {idle}"
+        );
+
+        metrics::with_local_recorder(&recorder, || emit_policy_gauges(&config));
+        assert!(
+            handle
+                .render()
+                .contains("buzz_permessage_deflate_enabled 0"),
+            "re-emission must restore an evicted series"
+        );
+    }
 }

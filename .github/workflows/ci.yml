@@ -684,8 +684,8 @@ jobs:
         #
         # demo_join_forwarded_arm_round_trips_echo is quarantined by exact name:
         # it self-skips when Redis is unreachable and fails 8 of 12 full-suite
-        # runs when Redis is present, always on its own 10s echo timeout. The
-        # other 903 non-ignored relay lib tests run.
+        # runs when Redis is present, always on its own 10s echo timeout. Every
+        # other non-ignored relay lib test runs — 905 of them at this commit.
         # TODO: cite the tracker as a full URL once the issue venue is settled —
         # a bare #N resolves against whichever repository renders this file.
         run: |

@@ -156,14 +156,9 @@ async fn main() -> anyhow::Result<()> {
     let usage_interval_secs = usage_metrics_interval_secs();
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
     relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
-    metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
-    // The relay-owned record of which compression policy a run served under.
-    // A perf arm is otherwise only attributable to whoever set the variable.
-    metrics::gauge!("buzz_permessage_deflate_enabled").set(if config.permessage_deflate_enabled {
-        1.0
-    } else {
-        0.0
-    });
+    // The relay-owned record of which policies a run served under: a perf arm is
+    // otherwise attributable only to whoever set the variable.
+    relay_metrics::emit_policy_gauges(&config);
     if config.permessage_deflate_enabled {
         info!(
             "permessage-deflate enabled by BUZZ_PERMESSAGE_DEFLATE_ENABLED; every negotiated connection holds a compressor and a decompressor"
@@ -1131,6 +1126,9 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     0.0
                 });
+                // Under the gauge idle timeout by construction: that window is
+                // floored at three of these intervals, so neither can age out.
+                relay_metrics::emit_policy_gauges(&usage_state.config);
             }
         });
     }
