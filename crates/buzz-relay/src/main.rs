@@ -157,6 +157,18 @@ async fn main() -> anyhow::Result<()> {
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
     relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
     metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
+    // The relay-owned record of which compression policy a run served under.
+    // A perf arm is otherwise only attributable to whoever set the variable.
+    metrics::gauge!("buzz_permessage_deflate_enabled").set(if config.permessage_deflate_enabled {
+        1.0
+    } else {
+        0.0
+    });
+    if config.permessage_deflate_enabled {
+        info!(
+            "permessage-deflate enabled by BUZZ_PERMESSAGE_DEFLATE_ENABLED; every negotiated connection holds a compressor and a decompressor"
+        );
+    }
     info!(
         port = config.metrics_port,
         idle_timeout_secs = usage_idle_timeout_secs,

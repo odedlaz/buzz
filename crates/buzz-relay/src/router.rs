@@ -320,6 +320,7 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+    let permessage_deflate_enabled = state.config.permessage_deflate_enabled;
 
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
@@ -332,7 +333,7 @@ async fn nip11_or_ws_handler(
             if state.shutting_down.load(Ordering::Relaxed) {
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
-            limit_relay_websocket(ws, max_frame_bytes)
+            limit_relay_websocket(ws, max_frame_bytes, permessage_deflate_enabled)
                 .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
                 .into_response()
         }
@@ -357,12 +358,22 @@ async fn nip11_or_ws_handler(
 fn limit_relay_websocket<F>(
     ws: WebSocketUpgrade<F>,
     max_frame_bytes: usize,
+    permessage_deflate_enabled: bool,
 ) -> WebSocketUpgrade<F> {
     // recv_loop keeps the application-level check as defense in depth, but
     // parser limits must be set before tungstenite assembles the message.
-    ws.max_message_size(max_frame_bytes)
-        .max_frame_size(max_frame_bytes)
-        .compression(PerMessageDeflate::new())
+    let limited = ws
+        .max_message_size(max_frame_bytes)
+        .max_frame_size(max_frame_bytes);
+
+    // Off must skip the call, not pass a weaker policy: constructing the
+    // extension allocates a compressor and a decompressor per connection and
+    // holds both for its lifetime, which is the cost this gate exists to avoid.
+    if permessage_deflate_enabled {
+        limited.compression(PerMessageDeflate::new())
+    } else {
+        limited
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -570,9 +581,11 @@ mod tests {
             get(move |ws: WebSocketUpgrade| {
                 let received_tx = received_tx.clone();
                 async move {
-                    limit_relay_websocket(ws, limit).on_upgrade(move |mut socket| async move {
-                        let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
-                    })
+                    limit_relay_websocket(ws, limit, false).on_upgrade(
+                        move |mut socket| async move {
+                            let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                        },
+                    )
                 }
             }),
         );
@@ -627,9 +640,11 @@ mod tests {
             get(move |ws: WebSocketUpgrade| {
                 let received_tx = received_tx.clone();
                 async move {
-                    limit_relay_websocket(ws, limit).on_upgrade(move |mut socket| async move {
-                        let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
-                    })
+                    limit_relay_websocket(ws, limit, true).on_upgrade(
+                        move |mut socket| async move {
+                            let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                        },
+                    )
                 }
             }),
         );
@@ -702,7 +717,7 @@ mod tests {
         let app = Router::new().route(
             "/",
             get(|ws: WebSocketUpgrade| async move {
-                limit_relay_websocket(ws, 1 << 20).on_upgrade(|mut socket| async move {
+                limit_relay_websocket(ws, 1 << 20, true).on_upgrade(|mut socket| async move {
                     let _ = socket.recv().await;
                 })
             }),
@@ -735,6 +750,49 @@ mod tests {
             negotiated,
             Some("permessage-deflate"),
             "the relay route must negotiate permessage-deflate for an offering client"
+        );
+    }
+
+    /// The gate's off state must decline the extension, not merely tolerate the
+    /// offer. A deflate-offering client connects either way, so only the absent
+    /// response header distinguishes "declined" from "negotiated".
+    #[tokio::test]
+    async fn relay_websocket_route_declines_permessage_deflate_when_gated_off() {
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                limit_relay_websocket(ws, 1 << 20, false).on_upgrade(|mut socket| async move {
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("a declined extension must still complete the handshake");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok());
+
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            negotiated, None,
+            "gated off, the relay must not negotiate permessage-deflate"
         );
     }
 }

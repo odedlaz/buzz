@@ -111,6 +111,12 @@ pub struct Config {
     pub send_buffer_size: usize,
     /// Maximum inbound WebSocket frame size in bytes.
     pub max_frame_bytes: usize,
+    /// Whether the relay negotiates the `permessage-deflate` WebSocket
+    /// extension. Defaults to false: each negotiated connection holds a
+    /// compressor and a decompressor for its lifetime, so this is enabled
+    /// per deployment rather than assumed.
+    /// Set `BUZZ_PERMESSAGE_DEFLATE_ENABLED=true` to offer it.
+    pub permessage_deflate_enabled: bool,
     /// Number of consecutive buffer-full events tolerated before cancelling a slow client.
     pub slow_client_grace_limit: u8,
     /// Authentication provider configuration.
@@ -908,6 +914,7 @@ impl Config {
         let privacy_markdown = read_policy_markdown("BUZZ_PRIVACY_POLICY_MARKDOWN")?;
         let age_attestation_required = parse_optional_bool("BUZZ_AGE_ATTESTATION_REQUIRED")?;
         let audit_enabled = parse_bool("BUZZ_AUDIT_ENABLED", true)?;
+        let permessage_deflate_enabled = parse_optional_bool("BUZZ_PERMESSAGE_DEFLATE_ENABLED")?;
         let join_policy = if terms_markdown.is_none()
             && privacy_markdown.is_none()
             && !age_attestation_required
@@ -1002,6 +1009,7 @@ impl Config {
             max_concurrent_handlers,
             send_buffer_size,
             max_frame_bytes,
+            permessage_deflate_enabled,
             slow_client_grace_limit,
             auth,
             require_auth_token,
@@ -1457,6 +1465,55 @@ mod tests {
             result,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_AUDIT_ENABLED")
+        ));
+    }
+
+    #[test]
+    fn permessage_deflate_defaults_off_and_accepts_explicit_on() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_PERMESSAGE_DEFLATE_ENABLED");
+
+        std::env::remove_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED");
+        let unset = Config::from_env()
+            .expect("config")
+            .permessage_deflate_enabled;
+
+        std::env::set_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED", "true");
+        let enabled = Config::from_env()
+            .expect("config")
+            .permessage_deflate_enabled;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED");
+        }
+
+        assert!(
+            !unset,
+            "an absent variable must not negotiate the extension"
+        );
+        assert!(enabled, "an explicit true must negotiate the extension");
+    }
+
+    #[test]
+    fn permessage_deflate_rejects_invalid_boolean() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_PERMESSAGE_DEFLATE_ENABLED");
+
+        std::env::set_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED", "sometimes");
+        let result = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_PERMESSAGE_DEFLATE_ENABLED");
+        }
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_PERMESSAGE_DEFLATE_ENABLED")
         ));
     }
 
