@@ -618,6 +618,82 @@ mod tests {
         );
     }
 
+    /// Drives the production route with a deflate-offering client and reports
+    /// whether a Ping of `size` bytes reached the handler.
+    async fn negotiated_handler_receives_ping_with_limit(limit: usize, size: usize) -> bool {
+        let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let received_tx = received_tx.clone();
+                async move {
+                    limit_relay_websocket(ws, limit).on_upgrade(move |mut socket| async move {
+                        let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                    })
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (mut client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("connect deflate-offering test client");
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_EXTENSIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("permessage-deflate"),
+            "this row only means something on a negotiated socket"
+        );
+        client
+            .send(tungstenite_pmd::protocol::Message::Ping(
+                vec![0; size].into(),
+            ))
+            .await
+            .expect("send test Ping");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), received_rx.recv())
+            .await
+            .expect("server should process the test Ping")
+            .expect("server should report whether it received the Ping");
+
+        server.abort();
+        let _ = server.await;
+
+        received
+    }
+
+    /// Keeps `max_frame_size` bound to the production route once compression is
+    /// negotiated. Buzz sets both limits to one value, so a text message cannot
+    /// say which one rejected it; a control frame can, because tungstenite
+    /// checks the frame limit before opcode dispatch and never consults
+    /// `max_message_size` on the control path.
+    #[tokio::test]
+    async fn negotiated_relay_websocket_keeps_the_frame_limit_on_control_frames() {
+        let limit = 64;
+
+        assert!(
+            negotiated_handler_receives_ping_with_limit(limit, limit).await,
+            "a Ping at the relay limit should still reach the handler"
+        );
+        assert!(
+            !negotiated_handler_receives_ping_with_limit(limit, limit + 1).await,
+            "an oversized Ping must be rejected by the frame limit, which the message limit cannot do"
+        );
+    }
+
     /// Binds the production compression policy. The `deflate_integration_tests`
     /// rows build their own upgrade, so without this assertion deleting
     /// `.compression(...)` from `limit_relay_websocket` leaves every row green.
