@@ -1282,7 +1282,7 @@ async fn serve(
         .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
     info!(port = config.health_port, "Health probe listener started");
     tokio::spawn(async move {
-        axum::serve(health_listener, health_router).await.ok();
+        axum::serve(health_listener, health_router).await;
     });
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -1382,8 +1382,7 @@ async fn serve(
                 .with_graceful_shutdown(async move {
                     uds_rx.changed().await.ok();
                 })
-                .await
-                .ok();
+                .await;
         });
 
         let mut tcp_rx = shutdown_tx.subscribe();
@@ -1394,8 +1393,7 @@ async fn serve(
         .with_graceful_shutdown(async move {
             tcp_rx.changed().await.ok();
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("TCP server error: {e}"))?;
+        .await;
 
         let hard_shutdown = shutdown_handle
             .await
@@ -1419,8 +1417,7 @@ async fn serve(
     .with_graceful_shutdown(async move {
         tcp_rx.changed().await.ok();
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
+    .await;
 
     let hard_shutdown = shutdown_handle
         .await

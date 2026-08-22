@@ -48,7 +48,10 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "
 tokio-util  = { version = "0.7", features = ["rt", "codec"] }
 
 # HTTP + WebSocket
-axum        = { version = "0.8", features = ["ws", "macros"] }
+# Keep all first-party crates on one axum type universe while leaving
+# third-party dependencies on their own crates.io resolution. Revert the git
+# source once the axum feature lands upstream.
+axum        = { git = "https://github.com/odedlaz/axum", rev = "cf17e4f89c8cd7c084ce87d00e38db4d341bca92", features = ["ws", "ws-deflate", "macros"] }
 tower       = { version = "0.5", features = ["timeout", "util", "limit"] }
 tower-http  = { version = "0.6", features = ["trace", "cors", "compression-gzip", "limit", "timeout", "fs"] }
 
@@ -123,6 +126,10 @@ futures-util = "0.3"
 
 # WebSocket client (test client)
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# Direct 0.30 aliases are test-only clients for the relay's PMD wire and ratio
+# integration rows. Production reaches the same crates through axum.
+tokio-tungstenite-pmd = { package = "tokio-tungstenite", version = "0.30" }
+tungstenite-pmd = { package = "tungstenite", version = "0.30", features = ["deflate"] }
 url = "2"
 
 # Property-based testing (dev-only)
@@ -182,4 +189,7 @@ strip = true
 # (FULL_URI + token-file + Authorization header, refresh-safe, with a loopback
 # allowlist for the auth token). Revert to crates.io once #449 lands upstream.
 [patch.crates-io]
+# Both axum and the test-only PMD client resolve the exact compact implementation.
+# Revert this pin once permessage-deflate lands upstream.
+tungstenite = { git = "https://github.com/odedlaz/tungstenite-rs", rev = "c9c84f0725a55f47d9811bcc776e9efe7f21110a" }
 aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce3620dd434c1f810101d672cf384268dbb0f" }

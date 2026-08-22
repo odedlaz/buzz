@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
+    extract::{ConnectInfo, FromRequest, PerMessageDeflate, State, WebSocketUpgrade},
     http::{HeaderMap, Request, StatusCode},
     middleware,
     response::{IntoResponse, Json},
@@ -320,6 +320,7 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
             // Shutting down: refuse new sockets instead of accepting a
@@ -361,6 +362,7 @@ fn limit_relay_websocket<F>(
     // parser limits must be set before tungstenite assembles the message.
     ws.max_message_size(max_frame_bytes)
         .max_frame_size(max_frame_bytes)
+        .compression(PerMessageDeflate::new())
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -579,9 +581,7 @@ mod tests {
             .expect("bind test WebSocket listener");
         let addr = listener.local_addr().expect("test listener address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test WebSocket server");
+            axum::serve(listener, app).await;
         });
 
         let (mut client, _) = connect_async(format!("ws://{addr}/"))

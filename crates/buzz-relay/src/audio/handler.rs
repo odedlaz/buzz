@@ -1409,9 +1409,7 @@ mod tests {
             .expect("bind test WebSocket listener");
         let addr = listener.local_addr().expect("test listener address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test WebSocket server");
+            axum::serve(listener, app).await;
         });
 
         let (mut client, _) = connect_async(format!("ws://{addr}/"))
