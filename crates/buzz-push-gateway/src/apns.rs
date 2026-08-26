@@ -292,7 +292,9 @@ mod tests {
             .with_state(bodies.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
 
         let signing_key = SigningKey::from_slice(&[7; 32]).unwrap();
         let pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();

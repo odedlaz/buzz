@@ -17,6 +17,9 @@ pub mod config;
 pub mod conformance;
 /// WebSocket connection lifecycle and state.
 pub mod connection;
+/// Axum-backed permessage-deflate integration and corpus checks.
+#[cfg(test)]
+mod deflate_integration_tests;
 /// Relay error types.
 pub mod error;
 /// WebSocket message handlers for NIP-01 client commands.

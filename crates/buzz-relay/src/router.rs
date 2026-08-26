@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
+    extract::{ConnectInfo, FromRequest, PerMessageDeflate, State, WebSocketUpgrade},
     http::{HeaderMap, Request, StatusCode},
     middleware,
     response::{IntoResponse, Json},
@@ -320,6 +320,8 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+    let permessage_deflate_enabled = state.config.permessage_deflate_enabled;
+
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
             // Shutting down: refuse new sockets instead of accepting a
@@ -331,7 +333,7 @@ async fn nip11_or_ws_handler(
             if state.shutting_down.load(Ordering::Relaxed) {
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
-            limit_relay_websocket(ws, max_frame_bytes)
+            limit_relay_websocket(ws, max_frame_bytes, permessage_deflate_enabled)
                 .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
                 .into_response()
         }
@@ -356,11 +358,24 @@ async fn nip11_or_ws_handler(
 fn limit_relay_websocket<F>(
     ws: WebSocketUpgrade<F>,
     max_frame_bytes: usize,
+    permessage_deflate_enabled: bool,
 ) -> WebSocketUpgrade<F> {
     // recv_loop keeps the application-level check as defense in depth, but
     // parser limits must be set before tungstenite assembles the message.
-    ws.max_message_size(max_frame_bytes)
-        .max_frame_size(max_frame_bytes)
+    let limited = ws
+        .max_message_size(max_frame_bytes)
+        .max_frame_size(max_frame_bytes);
+
+    // Off must skip the call rather than weaken the policy: `new()` only
+    // installs a policy, and any policy still offers the extension — the fork
+    // documents `no_context_takeover` as not reducing memory. The cost lands
+    // when an offer negotiates, holding a compressor and a decompressor for the
+    // lifetime of every such connection.
+    if permessage_deflate_enabled {
+        limited.compression(PerMessageDeflate::new())
+    } else {
+        limited
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -463,6 +478,7 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::header::SEC_WEBSOCKET_EXTENSIONS;
     use axum::{routing::get, Router};
     use futures_util::SinkExt;
     use opentelemetry::trace::TracerProvider as _;
@@ -567,9 +583,11 @@ mod tests {
             get(move |ws: WebSocketUpgrade| {
                 let received_tx = received_tx.clone();
                 async move {
-                    limit_relay_websocket(ws, limit).on_upgrade(move |mut socket| async move {
-                        let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
-                    })
+                    limit_relay_websocket(ws, limit, false).on_upgrade(
+                        move |mut socket| async move {
+                            let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                        },
+                    )
                 }
             }),
         );
@@ -579,9 +597,7 @@ mod tests {
             .expect("bind test WebSocket listener");
         let addr = listener.local_addr().expect("test listener address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test WebSocket server");
+            axum::serve(listener, app).await;
         });
 
         let (mut client, _) = connect_async(format!("ws://{addr}/"))
@@ -614,6 +630,294 @@ mod tests {
         assert!(
             !handler_receives_message_with_limit(limit, limit + 1).await,
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
+        );
+    }
+
+    /// Drives the production route with a deflate-offering client and reports
+    /// whether a Ping of `size` bytes reached the handler.
+    async fn negotiated_handler_receives_ping_with_limit(limit: usize, size: usize) -> bool {
+        let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let received_tx = received_tx.clone();
+                async move {
+                    limit_relay_websocket(ws, limit, true).on_upgrade(
+                        move |mut socket| async move {
+                            let _ = received_tx.send(matches!(socket.recv().await, Some(Ok(_))));
+                        },
+                    )
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (mut client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("connect deflate-offering test client");
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_EXTENSIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("permessage-deflate"),
+            "this row only means something on a negotiated socket"
+        );
+        client
+            .send(tungstenite_pmd::protocol::Message::Ping(
+                vec![0; size].into(),
+            ))
+            .await
+            .expect("send test Ping");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), received_rx.recv())
+            .await
+            .expect("server should process the test Ping")
+            .expect("server should report whether it received the Ping");
+
+        server.abort();
+        let _ = server.await;
+
+        received
+    }
+
+    /// Keeps `max_frame_size` bound to the production route once compression is
+    /// negotiated. Buzz sets both limits to one value, so a text message cannot
+    /// say which one rejected it; a control frame can, because tungstenite
+    /// checks the frame limit before opcode dispatch and never consults
+    /// `max_message_size` on the control path.
+    #[tokio::test]
+    async fn negotiated_relay_websocket_keeps_the_frame_limit_on_control_frames() {
+        let limit = 64;
+
+        assert!(
+            negotiated_handler_receives_ping_with_limit(limit, limit).await,
+            "a Ping at the relay limit should still reach the handler"
+        );
+        assert!(
+            !negotiated_handler_receives_ping_with_limit(limit, limit + 1).await,
+            "an oversized Ping must be rejected by the frame limit, which the message limit cannot do"
+        );
+    }
+
+    /// Binds the production compression policy. The `deflate_integration_tests`
+    /// rows build their own upgrade, so without this assertion deleting
+    /// `.compression(...)` from `limit_relay_websocket` leaves every row green.
+    #[tokio::test]
+    async fn relay_websocket_route_negotiates_permessage_deflate() {
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                limit_relay_websocket(ws, 1 << 20, true).on_upgrade(|mut socket| async move {
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("connect deflate-offering test client");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok());
+
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            negotiated,
+            Some("permessage-deflate"),
+            "the relay route must negotiate permessage-deflate for an offering client"
+        );
+    }
+
+    /// The gate's off state must decline the extension, not merely tolerate the
+    /// offer. A deflate-offering client connects either way, so only the absent
+    /// response header distinguishes "declined" from "negotiated".
+    #[tokio::test]
+    async fn relay_websocket_route_declines_permessage_deflate_when_gated_off() {
+        let app = Router::new().route(
+            "/",
+            get(|ws: WebSocketUpgrade| async move {
+                limit_relay_websocket(ws, 1 << 20, false).on_upgrade(|mut socket| async move {
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test WebSocket listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{addr}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("a declined extension must still complete the handshake");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok());
+
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            negotiated, None,
+            "gated off, the relay must not negotiate permessage-deflate"
+        );
+    }
+
+    /// Build a production `AppState` whose route can actually bind a tenant.
+    ///
+    /// `bind_community` is a real query, so the pool connects eagerly here: a
+    /// lazy pool would defer the failure into a 404 that this test cannot tell
+    /// apart from a gated-off relay.
+    async fn production_state(enabled: bool, authority: &str) -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.permessage_deflate_enabled = enabled;
+        config.require_relay_membership = false;
+        config.require_auth_token = false;
+
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("the production route binds its tenant from Postgres");
+        sqlx::query(
+            "INSERT INTO communities (id, host) VALUES ($1, $2) ON CONFLICT (lower(host)) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(authority)
+        .execute(&pool)
+        .await
+        .expect("seed the community this test's host maps to");
+
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    /// Handshake a deflate-offering client against the real router and report
+    /// what the production composition negotiated.
+    async fn negotiate_through_production_route(enabled: bool) -> (StatusCode, Option<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind production route listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let authority = format!("127.0.0.1:{}", addr.port());
+        let state = production_state(enabled, &authority).await;
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_router(state)).await;
+        });
+
+        let (_client, response) = tokio_tungstenite_pmd::connect_async_with_config(
+            format!("ws://{authority}/"),
+            Some(tungstenite_pmd::protocol::WebSocketConfig::default().enable_deflate()),
+            false,
+        )
+        .await
+        .expect("the production route must complete the handshake");
+        let negotiated = response
+            .headers()
+            .get(SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let status = response.status();
+
+        server.abort();
+        let _ = server.await;
+
+        (status, negotiated)
+    }
+
+    /// The four rows above call `limit_relay_websocket` with literals, so
+    /// replacing the production read at `nip11_or_ws_handler` with a constant
+    /// leaves every one of them green. This row is the only one that fails.
+    ///
+    /// Each arm asserts the 101 before the header: the gate sits downstream of
+    /// the host-to-tenant bind, and an unmapped host answers 404 carrying no
+    /// extension header — byte-identical to a correctly gated-off relay, and
+    /// green even with the branch deleted.
+    #[tokio::test]
+    async fn production_route_negotiates_deflate_only_when_the_config_enables_it() {
+        let (off_status, off_negotiated) = negotiate_through_production_route(false).await;
+        assert_eq!(
+            off_status,
+            StatusCode::SWITCHING_PROTOCOLS,
+            "the off arm must reach the gate, not stop at a tenant rejection"
+        );
+        assert_eq!(
+            off_negotiated, None,
+            "default-off must decline the extension on the production route"
+        );
+
+        let (on_status, on_negotiated) = negotiate_through_production_route(true).await;
+        assert_eq!(
+            on_status,
+            StatusCode::SWITCHING_PROTOCOLS,
+            "the on arm must reach the gate, not stop at a tenant rejection"
+        );
+        assert_eq!(
+            on_negotiated.as_deref(),
+            Some("permessage-deflate"),
+            "explicit on must negotiate exactly the parameter-free extension"
         );
     }
 }

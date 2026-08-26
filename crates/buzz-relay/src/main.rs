@@ -153,10 +153,20 @@ async fn main() -> anyhow::Result<()> {
         "Config loaded"
     );
 
-    let usage_interval_secs = usage_metrics_interval_secs();
-    let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
+    let usage_interval_secs = relay_metrics::usage_metrics_interval_secs();
+    let usage_idle_timeout_secs =
+        relay_metrics::usage_metrics_idle_timeout_secs(usage_interval_secs);
     relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
-    metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
+    // The relay-owned record of which policies a run served under: a perf arm is
+    // otherwise attributable only to whoever set the variable. Kept alongside the
+    // refresh task so the first scrape is served before that task is polled.
+    relay_metrics::emit_policy_gauges(&config);
+    relay_metrics::spawn_policy_gauge_refresh(config.clone(), usage_idle_timeout_secs);
+    if config.permessage_deflate_enabled {
+        info!(
+            "permessage-deflate enabled by BUZZ_PERMESSAGE_DEFLATE_ENABLED; every negotiated connection holds a compressor and a decompressor"
+        );
+    }
     info!(
         port = config.metrics_port,
         idle_timeout_secs = usage_idle_timeout_secs,
@@ -1282,7 +1292,7 @@ async fn serve(
         .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
     info!(port = config.health_port, "Health probe listener started");
     tokio::spawn(async move {
-        axum::serve(health_listener, health_router).await.ok();
+        axum::serve(health_listener, health_router).await;
     });
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -1382,8 +1392,7 @@ async fn serve(
                 .with_graceful_shutdown(async move {
                     uds_rx.changed().await.ok();
                 })
-                .await
-                .ok();
+                .await;
         });
 
         let mut tcp_rx = shutdown_tx.subscribe();
@@ -1394,8 +1403,7 @@ async fn serve(
         .with_graceful_shutdown(async move {
             tcp_rx.changed().await.ok();
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("TCP server error: {e}"))?;
+        .await;
 
         let hard_shutdown = shutdown_handle
             .await
@@ -1419,8 +1427,7 @@ async fn serve(
     .with_graceful_shutdown(async move {
         tcp_rx.changed().await.ok();
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
+    .await;
 
     let hard_shutdown = shutdown_handle
         .await
@@ -1458,29 +1465,6 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
     });
 
     serde_json::from_value(event_json).expect("valid event JSON from DB row")
-}
-
-/// Return the usage poll interval, with a floor that prevents a busy loop.
-fn usage_metrics_interval_secs() -> u64 {
-    std::env::var("BUZZ_USAGE_METRICS_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(300)
-        .max(5)
-}
-
-/// Return a gauge lifetime that always outlives several usage-poller ticks.
-fn usage_metrics_idle_timeout_secs(interval_secs: u64) -> u64 {
-    let configured = std::env::var("BUZZ_USAGE_METRICS_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok());
-    idle_timeout_secs(configured, interval_secs)
-}
-
-fn idle_timeout_secs(configured: Option<u64>, interval_secs: u64) -> u64 {
-    configured
-        .unwrap_or(900)
-        .max(interval_secs.saturating_mul(3))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2036,9 +2020,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
-        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        buzz_auto_migrate_enabled, dropped_in_memory_keys, refresh_legacy_active_gauge_recency,
+        run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey,
     };
     use metrics::GaugeFn;
     use metrics_util::{
@@ -2151,11 +2134,5 @@ mod tests {
         gauge.increment(0.0);
 
         assert!(gauge.get_generation() > generation_before);
-    }
-
-    #[test]
-    fn test_idle_timeout_is_at_least_three_usage_intervals() {
-        assert_eq!(idle_timeout_secs(None, 300), 900);
-        assert_eq!(idle_timeout_secs(Some(10), 1_000), 3_000);
     }
 }

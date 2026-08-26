@@ -1,4 +1,5 @@
-//! Prometheus metrics: recorder setup, upkeep task, and HTTP middleware.
+//! Prometheus metrics: recorder setup, upkeep task, policy-gauge refresh,
+//! and HTTP middleware.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────┐
@@ -55,6 +56,14 @@ const GIT_PACK_BUCKETS: [f64; 9] = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 1
 
 /// Integer-count buckets for fan-out recipient histograms.
 const FANOUT_BUCKETS: [f64; 9] = [0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0];
+
+/// Floor on the usage poll interval. The idle window is floored against the
+/// interval, so this also sets the shortest window the relay can be given.
+const USAGE_METRICS_MIN_INTERVAL_SECS: u64 = 5;
+
+/// Policy-gauge refreshes per idle window. Three leaves a whole spare refresh
+/// inside the window, so one missed wakeup cannot drop a series.
+const POLICY_GAUGE_REFRESHES_PER_WINDOW: u64 = 3;
 
 /// Install the global metrics recorder and spawn the Prometheus HTTP exporter.
 ///
@@ -146,6 +155,70 @@ pub fn install(port: u16, gauge_idle_timeout_secs: u64) {
     tokio::spawn(exporter);
 }
 
+/// Return the usage poll interval, with a floor that prevents a busy loop.
+pub fn usage_metrics_interval_secs() -> u64 {
+    std::env::var("BUZZ_USAGE_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300)
+        .max(USAGE_METRICS_MIN_INTERVAL_SECS)
+}
+
+/// Return a gauge lifetime that always outlives several usage-poller ticks, so
+/// that the poller's own gauges survive between its ticks.
+pub fn usage_metrics_idle_timeout_secs(interval_secs: u64) -> u64 {
+    let configured = std::env::var("BUZZ_USAGE_METRICS_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    idle_timeout_secs(configured, interval_secs)
+}
+
+fn idle_timeout_secs(configured: Option<u64>, interval_secs: u64) -> u64 {
+    configured
+        .unwrap_or(900)
+        .max(interval_secs.saturating_mul(3))
+}
+
+/// Return the policy-gauge refresh period for a gauge idle window.
+///
+/// `tokio::time::interval` panics on a zero period, so keep the period at one
+/// second even for a window [`usage_metrics_idle_timeout_secs`] cannot produce.
+fn policy_gauge_refresh_secs(gauge_idle_timeout_secs: u64) -> u64 {
+    (gauge_idle_timeout_secs / POLICY_GAUGE_REFRESHES_PER_WINDOW).max(1)
+}
+
+/// Spawn the task that keeps the static policy gauges from aging out.
+///
+/// Nothing but its own timer may sit in front of the emission. Refreshing from
+/// the usage poller's loop put it behind that tick's unbounded database and lock
+/// work, so the gap between writes was the tick duration, not the cadence.
+///
+/// Must be called from within a Tokio runtime.
+pub fn spawn_policy_gauge_refresh(config: crate::config::Config, gauge_idle_timeout_secs: u64) {
+    let period = Duration::from_secs(policy_gauge_refresh_secs(gauge_idle_timeout_secs));
+    tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(period);
+        loop {
+            refresh.tick().await;
+            emit_policy_gauges(&config);
+        }
+    });
+}
+
+/// Write the relay's static policy gauges.
+///
+/// [`install`] evicts any gauge that goes idle, and nothing else ever writes
+/// these two series, so a boot-only emission leaves the scrape output one idle
+/// window later. [`spawn_policy_gauge_refresh`] is what keeps them present.
+pub fn emit_policy_gauges(config: &crate::config::Config) {
+    metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
+    metrics::gauge!("buzz_permessage_deflate_enabled").set(if config.permessage_deflate_enabled {
+        1.0
+    } else {
+        0.0
+    });
+}
+
 /// Axum middleware that records CAKE framework HTTP metrics.
 ///
 /// Emits:
@@ -204,4 +277,127 @@ pub async fn track_metrics(req: Request, next: Next) -> Response {
     metrics::histogram!("http_request_latency_ms", &labels).record(latency_ms);
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_idle_window_outlives_three_usage_poller_ticks() {
+        assert_eq!(idle_timeout_secs(None, 300), 900);
+        assert_eq!(idle_timeout_secs(Some(10), 1_000), 3_000);
+    }
+
+    /// The cadence has to fit every window the relay can be given, so sweep the
+    /// reachable domain through the production helpers, not one chosen pair.
+    #[test]
+    fn the_policy_refresh_fits_inside_every_reachable_idle_window() {
+        let intervals = [
+            USAGE_METRICS_MIN_INTERVAL_SECS,
+            USAGE_METRICS_MIN_INTERVAL_SECS + 1,
+            300,
+            3_600,
+            u64::MAX,
+        ];
+        for interval_secs in intervals {
+            for configured in [None, Some(0), Some(1), Some(15), Some(900), Some(u64::MAX)] {
+                let window = idle_timeout_secs(configured, interval_secs);
+                let refresh = policy_gauge_refresh_secs(window);
+                assert!(refresh > 0, "tokio::time::interval panics on a zero period");
+                assert!(
+                    refresh * POLICY_GAUGE_REFRESHES_PER_WINDOW <= window,
+                    "a {refresh}s refresh must fit {POLICY_GAUGE_REFRESHES_PER_WINDOW} times \
+                     into a {window}s window (interval {interval_secs}s, configured {configured:?})"
+                );
+            }
+        }
+    }
+
+    /// The arithmetic above only bounds the cadence; this pins that the task
+    /// actually keeps the series alive with nothing driving it.
+    #[test]
+    fn the_spawned_refresh_restores_an_evicted_gauge_unattended() {
+        const IDLE: Duration = Duration::from_millis(50);
+        // The shortest window whose refresh period is still a whole second.
+        const WINDOW_SECS: u64 = POLICY_GAUGE_REFRESHES_PER_WINDOW;
+        let period = Duration::from_secs(policy_gauge_refresh_secs(WINDOW_SECS));
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(MetricKindMask::GAUGE, Some(IDLE))
+            .build_recorder();
+        let handle = recorder.handle();
+        let config = crate::config::Config::from_env().expect("default config loads");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime with a timer");
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                spawn_policy_gauge_refresh(config, WINDOW_SECS);
+
+                tokio::time::sleep(IDLE / 5).await;
+                assert!(
+                    handle.render().contains("buzz_permessage_deflate_enabled"),
+                    "the task must emit on its first tick, not one period later"
+                );
+
+                // Eviction is measured against the render above: the recorder
+                // tracks idleness from the last observation, so an unrendered
+                // series is never reaped.
+                tokio::time::sleep(IDLE * 2).await;
+                handle.run_upkeep();
+                assert!(
+                    !handle.render().contains("buzz_permessage_deflate_enabled"),
+                    "the series must be evicted first, or the restore proves nothing"
+                );
+
+                tokio::time::sleep(period).await;
+                assert!(
+                    handle.render().contains("buzz_permessage_deflate_enabled"),
+                    "the refresh task must restore the series with no other caller"
+                );
+            });
+        });
+    }
+
+    /// Re-emitting on a cadence only helps if idle eviction is real and a later
+    /// write restores the series, so pin both rather than trusting the
+    /// exporter's documentation.
+    #[test]
+    fn policy_gauges_are_evicted_when_idle_and_restored_by_re_emission() {
+        const IDLE: Duration = Duration::from_millis(50);
+        let recorder = PrometheusBuilder::new()
+            .idle_timeout(MetricKindMask::GAUGE, Some(IDLE))
+            .build_recorder();
+        let handle = recorder.handle();
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.audit_enabled = true;
+        config.permessage_deflate_enabled = false;
+
+        metrics::with_local_recorder(&recorder, || emit_policy_gauges(&config));
+        // Distinct values, so a swap inside the helper fails here too.
+        let fresh = handle.render();
+        assert!(fresh.contains("buzz_audit_enabled 1"), "{fresh}");
+        assert!(
+            fresh.contains("buzz_permessage_deflate_enabled 0"),
+            "{fresh}"
+        );
+
+        std::thread::sleep(IDLE * 2);
+        handle.run_upkeep();
+        let idle = handle.render();
+        assert!(
+            !idle.contains("buzz_permessage_deflate_enabled"),
+            "a boot-only gauge does not survive its idle window: {idle}"
+        );
+
+        metrics::with_local_recorder(&recorder, || emit_policy_gauges(&config));
+        assert!(
+            handle
+                .render()
+                .contains("buzz_permessage_deflate_enabled 0"),
+            "re-emission must restore an evicted series"
+        );
+    }
 }
